@@ -1,0 +1,13 @@
+{
+  "name": "scancore-web",
+  "version": "1.0.0",
+  "description": "Sync server for the SCANCORE app: accounts and device sync on your own machine",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.mjs",
+    "test": "node --disable-warning=ExperimentalWarning --test test.mjs"
+  }
+}

@@ -1,0 +1,32 @@
+# SCANCORE sync server. On a home network, `docker compose up -d` and use
+# http://<this computer's address>:8787 in the app.
+# For the internet with HTTPS, set SCANCORE_DOMAIN in .env and run
+# `docker compose --profile https up -d` (Caddy gets the certificate).
+services:
+  sync:
+    image: ghcr.io/medium-gh/scancore-web:latest
+    build: .
+    restart: unless-stopped
+    environment:
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    ports:
+      - "${PORT:-8787}:8787"
+    volumes:
+      - scancore-data:/data
+  caddy:
+    profiles: [https]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [sync]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SCANCORE_DOMAIN: ${SCANCORE_DOMAIN:?Set SCANCORE_DOMAIN in .env for the https profile}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+volumes:
+  scancore-data:
+  caddy-data:
