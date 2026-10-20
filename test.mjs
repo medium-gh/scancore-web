@@ -45,7 +45,7 @@ const put = (cookie, id, body) =>
 
 test("capabilities say devices only", async () => {
   const caps = await (await fetch(`${base}/api/capabilities`)).json();
-  assert.deepEqual(caps.appSync, { devices: true, devicesOnly: true });
+  assert.deepEqual(caps.appSync, { devices: true, devicesOnly: true, live: true });
 });
 
 test("accounts: rules, sign-in, session, sign-out", async () => {
@@ -95,4 +95,78 @@ test("a large snapshot fits", async () => {
   const a = await signUp("reader_four");
   const blob = "x".repeat(5 * 1024 * 1024);
   assert.equal((await put(a, "device-big-0001", { name: "Big", platform: "linux", data: { blob } })).status, 200);
+});
+
+// Reads a live stream's events as they come.
+function listen(cookie, id, name) {
+  const controller = new AbortController();
+  const events = [];
+  let wake = () => {};
+  const ready = fetch(`${base}/api/app/live?device=${id}&name=${name}&platform=linux`, {
+    headers: { Cookie: cookie, Accept: "text/event-stream" },
+    signal: controller.signal,
+  }).then(async (response) => {
+    assert.equal(response.status, 200);
+    (async () => {
+      const decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        for await (const chunk of response.body) {
+          buffer += decoder.decode(chunk, { stream: true });
+          let end;
+          while ((end = buffer.indexOf("\n\n")) >= 0) {
+            const block = buffer.slice(0, end);
+            buffer = buffer.slice(end + 2);
+            const event = /^event: (.*)$/m.exec(block)?.[1];
+            const data = /^data: (.*)$/m.exec(block)?.[1];
+            if (event) events.push({ event, data: JSON.parse(data) });
+            wake();
+          }
+        }
+      } catch {}
+    })();
+  });
+  const next = async (event) => {
+    for (let i = 0; i < 50; i++) {
+      const index = events.findIndex((e) => e.event === event);
+      if (index >= 0) return events.splice(index, 1)[0].data;
+      await new Promise((resolve) => {
+        wake = resolve;
+        setTimeout(resolve, 100);
+      });
+    }
+    throw new Error(`no ${event} event`);
+  };
+  return { ready, next, events, close: () => controller.abort() };
+}
+
+test("live: presence, progress to the others, handoff to one device, isolation", async () => {
+  const a = await signUp("reader_live");
+  const b = await signUp("reader_else");
+  assert.equal((await fetch(`${base}/api/app/live?device=device-live-0001`)).status, 401);
+  const laptop = listen(a, "device-live-0001", "Laptop");
+  await laptop.ready;
+  const phone = listen(a, "device-live-0002", "Phone");
+  await phone.ready;
+  const stranger = listen(b, "device-live-0009", "Other");
+  await stranger.ready;
+  // Each sees the other come online.
+  assert.equal((await laptop.next("presence")).device.name, "Phone");
+  assert.deepEqual(await phone.next("presence"), { device: { id: "device-live-0001", name: "Laptop", platform: "linux" }, online: true });
+  const post = (body) =>
+    fetch(`${base}/api/app/live`, { method: "POST", headers: { "Content-Type": "application/json", Cookie: a }, body: JSON.stringify(body) });
+  const from = { id: "device-live-0001", name: "Laptop", platform: "linux" };
+  assert.equal((await post({ from, type: "progress", data: { seriesId: "comic:x:1", unit: ["Ch 1"] } })).status, 202);
+  assert.deepEqual(await phone.next("progress"), { from, data: { seriesId: "comic:x:1", unit: ["Ch 1"] } });
+  assert.equal((await post({ from, type: "handoff", to: "device-live-0002", data: { seriesId: "s" } })).status, 202);
+  assert.equal((await phone.next("handoff")).data.seriesId, "s");
+  assert.equal(laptop.events.filter((e) => e.event === "progress" || e.event === "handoff").length, 0);
+  assert.equal((await post({ from, type: "nope", data: {} })).status, 400);
+  assert.equal((await post({ from: { id: "x" }, type: "progress", data: {} })).status, 400);
+  phone.close();
+  assert.equal((await laptop.next("presence")).online, false);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(stranger.events.length, 0);
+  laptop.close();
+  stranger.close();
 });

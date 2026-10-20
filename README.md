@@ -88,7 +88,7 @@ Environment variables:
 
 What the app uses, for anyone writing their own client:
 
-- `GET /api/capabilities` → `{appSync: {devices: true, devicesOnly: true}}`
+- `GET /api/capabilities` → `{appSync: {devices: true, devicesOnly: true, live: true}}`
 - `POST /api/auth/signup` `{email, username, password}`,
   `POST /api/auth/login` `{email (or username), password}`,
   `POST /api/auth/logout`, `GET /api/auth/session` → `{user | null}`
@@ -96,6 +96,14 @@ What the app uses, for anyone writing their own client:
   `{devices: [{deviceId, name, platform, updatedAt, data}]}`
 - `PUT /api/app/devices/<deviceId>` `{name, platform, data}` → `{updatedAt}`
 - `DELETE /api/app/devices/<deviceId>`
+- `GET /api/app/live?device=<id>&name=<name>&platform=<platform>`: a
+  stream of server-sent events while the app is open: `presence`
+  `{device, online}` for the account's other open apps, and `progress` or
+  `handoff` `{from, data}` as they send them. It ends after 15 minutes;
+  the app reconnects.
+- `POST /api/app/live` `{from: {id, name, platform}, type: "progress" |
+  "handoff", to?, data}` passes `data` on to the account's other open apps
+  (or only to `to`). Nothing is stored.
 
 ## Licence
 

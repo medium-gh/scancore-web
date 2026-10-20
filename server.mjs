@@ -10,6 +10,7 @@
 //   node server.mjs passwd <user> <new>  set an account's password
 //   node server.mjs delete <user>        delete an account and its devices
 
+import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { randomBytes, scrypt, timingSafeEqual, createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
@@ -17,7 +18,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const DATA_DIR = process.env.DATA_DIR ?? join(process.cwd(), "data");
@@ -235,6 +236,59 @@ const page = (signup) => `<!doctype html>
 }.</p>
 <p style="color:#8a8a94">scancore-web ${VERSION} · <a style="color:#8a8a94" href="https://github.com/medium-gh/scancore-web">source</a></p>`;
 
+// ------------------------------------------------------------------ live
+
+// Live progress between an account's apps: each open app keeps a stream of
+// server-sent events, and what one app sends (where it is in a chapter or
+// episode, or "continue on that device") goes straight to the others.
+// Nothing is stored; device snapshots still carry everything.
+const LIVE_PING_MS = 25_000;
+const LIVE_LIFETIME_MS = 15 * 60_000;
+const LIVE_MAX_BYTES = 32_768;
+const liveBus = new EventEmitter();
+liveBus.setMaxListeners(0);
+
+const liveDevice = (value) => {
+  const id = String(value?.id ?? "");
+  if (!/^[A-Za-z0-9-]{8,64}$/.test(id)) throw new HttpError(400, "Invalid device ID.");
+  return { id, name: String(value?.name ?? "").trim().slice(0, 80) || "SCANCORE", platform: String(value?.platform ?? "").trim().slice(0, 20) };
+};
+
+function liveStream(request, response, user, self) {
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-store, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  const write = (event, data) => response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const channel = `user:${user.id}`;
+  const listener = (message) => {
+    if (message.from.id === self.id || (message.to && message.to !== self.id)) return;
+    if (message.type === "hello") {
+      write("presence", { device: message.from, online: true });
+      liveBus.emit(channel, { type: "here", from: self, to: message.from.id });
+    } else if (message.type === "here") write("presence", { device: message.from, online: true });
+    else if (message.type === "bye") write("presence", { device: message.from, online: false });
+    else write(message.type, { from: message.from, data: message.data });
+  };
+  liveBus.on(channel, listener);
+  const ping = setInterval(() => response.write(": ping\n\n"), LIVE_PING_MS);
+  const end = setTimeout(() => response.end(), LIVE_LIFETIME_MS);
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    clearInterval(ping);
+    clearTimeout(end);
+    liveBus.off(channel, listener);
+    liveBus.emit(channel, { type: "bye", from: self });
+  };
+  response.on("close", finish);
+  response.write("retry: 15000\n\n");
+  liveBus.emit(channel, { type: "hello", from: self });
+}
+
 // ------------------------------------------------------------------ routes
 
 async function route(request, response) {
@@ -261,7 +315,7 @@ async function route(request, response) {
       server: "scancore-web",
       version: VERSION,
       signup: ALLOW_SIGNUP,
-      appSync: { devices: true, devicesOnly: true },
+      appSync: { devices: true, devicesOnly: true, live: true },
     });
 
   if (method === "POST" && path === "/api/auth/signup") {
@@ -355,6 +409,28 @@ async function route(request, response) {
     const user = requireUser(request);
     db.prepare("DELETE FROM devices WHERE user_id = ? AND device_id = ?").run(user.id, device[1]);
     return send(response, 200, { ok: true });
+  }
+
+  if (method === "GET" && path === "/api/app/live") {
+    const user = requireUser(request);
+    const self = liveDevice({
+      id: url.searchParams.get("device"),
+      name: url.searchParams.get("name"),
+      platform: url.searchParams.get("platform"),
+    });
+    return liveStream(request, response, user, self);
+  }
+
+  if (method === "POST" && path === "/api/app/live") {
+    const user = requireUser(request);
+    const body = await readJson(request, LIVE_MAX_BYTES);
+    const from = liveDevice(body.from);
+    if (body.type !== "progress" && body.type !== "handoff") throw new HttpError(400, "Unknown live message.");
+    if (typeof body.data !== "object" || body.data === null || Array.isArray(body.data)) throw new HttpError(400, "Invalid live message.");
+    const to = body.to == null ? undefined : liveDevice({ id: body.to }).id;
+    const delivered = liveBus.listenerCount(`user:${user.id}`);
+    liveBus.emit(`user:${user.id}`, { type: body.type, from, to, data: body.data });
+    return send(response, 202, { ok: true, listeners: delivered });
   }
 
   throw new HttpError(404, "Not found.");
