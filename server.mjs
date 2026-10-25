@@ -3,6 +3,8 @@
 // your own machine. Each app install keeps one snapshot here (its library,
 // removals, reading and watching progress, and activity) and reads the
 // others'; the app merges them itself, so the server only stores them.
+// Also: live progress between an account's apps, watch parties, friends
+// (and what they read), lists shared by link, and reactions on pages.
 //
 // No dependencies: Node's own HTTP server, SQLite and scrypt.
 //
@@ -12,13 +14,13 @@
 
 import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
-import { randomBytes, scrypt, timingSafeEqual, createHash } from "node:crypto";
+import { randomBytes, randomInt, scrypt, timingSafeEqual, createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const DATA_DIR = process.env.DATA_DIR ?? join(process.cwd(), "data");
@@ -28,6 +30,8 @@ const ALLOW_SIGNUP = (process.env.ALLOW_SIGNUP ?? "true") !== "false";
 const TRUST_PROXY = process.env.TRUST_PROXY === "true";
 const MAX_DEVICES = Number(process.env.MAX_DEVICES ?? 20);
 const MAX_SNAPSHOT = Number(process.env.MAX_SNAPSHOT_MB ?? 16) * 1024 * 1024;
+// Sign-in and sign-up attempts per address in 15 minutes.
+const ATTEMPT_LIMIT = Number(process.env.ATTEMPT_LIMIT ?? 10);
 const SESSION_DAYS = 90;
 const COOKIE = "scancore-sync";
 
@@ -61,7 +65,46 @@ db.exec(`
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (user_id, device_id)
   );
+  -- Friends: following each other.
+  CREATE TABLE IF NOT EXISTS follows (
+    follower INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    following INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (follower, following)
+  );
+  CREATE INDEX IF NOT EXISTS follows_following ON follows(following);
+  -- What readers who share it read and watched lately (friends see it).
+  CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS activity_user ON activity(user_id, created_at);
+  -- Lists shared by a code anyone can open.
+  CREATE TABLE IF NOT EXISTS shared_lists (
+    code TEXT PRIMARY KEY,
+    owner INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    items TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  -- Reactions on a chapter's pages: one per reader and page.
+  CREATE TABLE IF NOT EXISTS page_reactions (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    thread TEXT NOT NULL,
+    page INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, thread, page)
+  );
+  CREATE INDEX IF NOT EXISTS page_reactions_thread ON page_reactions(thread);
 `);
+// Whether a reader shares what they read with friends (off until they say).
+if (!db.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'share_activity'").get())
+  db.exec("ALTER TABLE users ADD COLUMN share_activity INTEGER NOT NULL DEFAULT 0");
 
 const now = () => Date.now();
 const sha256 = (text) => createHash("sha256").update(text).digest("hex");
@@ -139,13 +182,13 @@ function isHttps(request) {
   return request.socket.encrypted || (TRUST_PROXY && request.headers["x-forwarded-proto"] === "https");
 }
 
-// Sign-in and sign-up attempts: 10 per 15 minutes per address.
+// Sign-in and sign-up attempts: ATTEMPT_LIMIT per 15 minutes per address.
 const attempts = new Map();
 function limitAttempts(request) {
   const key = clientAddress(request);
   const window = 15 * 60 * 1000;
   const list = (attempts.get(key) ?? []).filter((at) => now() - at < window);
-  if (list.length >= 10) throw new HttpError(429, "Too many attempts. Wait a few minutes and try again.");
+  if (list.length >= ATTEMPT_LIMIT) throw new HttpError(429, "Too many attempts. Wait a few minutes and try again.");
   list.push(now());
   attempts.set(key, list);
 }
@@ -289,6 +332,215 @@ function liveStream(request, response, user, self) {
   liveBus.emit(channel, { type: "hello", from: self });
 }
 
+// ------------------------------------------------------------------ friends
+
+// Readers follow each other by username; both ways makes friends.
+const person = (row) => ({ id: String(row.id), username: row.username, displayName: null, avatarUrl: null });
+
+function friendsOf(userId) {
+  const following = db.prepare("SELECT users.id, users.username FROM follows JOIN users ON users.id = follows.following WHERE follows.follower = ?").all(userId);
+  const followers = db.prepare("SELECT users.id, users.username FROM follows JOIN users ON users.id = follows.follower WHERE follows.following = ?").all(userId);
+  const back = new Set(followers.map((r) => r.id));
+  const mine = new Set(following.map((r) => r.id));
+  return {
+    friends: following.filter((r) => back.has(r.id)).map(person),
+    sent: following.filter((r) => !back.has(r.id)).map(person),
+    received: followers.filter((r) => !mine.has(r.id)).map(person),
+  };
+}
+
+const httpsUrl = (value) => (typeof value === "string" && /^https?:\/\//.test(value) ? value.slice(0, 1000) : undefined);
+
+// One line per series an hour (a binge is its latest chapter), and only
+// for readers who share.
+function recordActivity(userId, type, item) {
+  const title = String(item.title ?? "").slice(0, 200);
+  if (!title) return;
+  if (!db.prepare("SELECT share_activity FROM users WHERE id = ?").get(userId)?.share_activity) return;
+  const payload = JSON.stringify({
+    media: item.media,
+    title,
+    unit: item.unit ? String(item.unit).slice(0, 200) : undefined,
+    cover: httpsUrl(item.cover),
+    source: item.source ? String(item.source).slice(0, 100) : undefined,
+    sourceUrl: httpsUrl(item.sourceUrl),
+  });
+  const recent = db.prepare("SELECT id FROM activity WHERE user_id = ? AND type = ? AND title = ? AND created_at > ?").get(userId, type, title, now() - 3600_000);
+  if (recent) db.prepare("UPDATE activity SET payload = ?, created_at = ? WHERE id = ?").run(payload, now(), recent.id);
+  else db.prepare("INSERT INTO activity(user_id, type, title, payload, created_at) VALUES(?, ?, ?, ?, ?)").run(userId, type, title, payload, now());
+  db.prepare("DELETE FROM activity WHERE user_id = ? AND created_at < ?").run(userId, now() - 90 * 86400_000);
+}
+
+// The app syncs here through device snapshots: what it read in the last
+// minutes becomes activity (seconds or milliseconds, as apps write them).
+function activityFromSnapshot(userId, data) {
+  const series = data?.series ?? {};
+  const progress = data?.progress ?? {};
+  const since = now() - 15 * 60_000;
+  const recent = [];
+  for (const [id, units] of Object.entries(progress)) {
+    let latest = null;
+    for (const unit of Object.values(units ?? {})) {
+      if (!Array.isArray(unit)) continue;
+      const raw = Number(unit[6]) || 0;
+      const at = raw < 1e12 ? raw * 1000 : raw;
+      if (at >= since && (!latest || at > latest.at)) latest = { at, title: unit[0], number: unit[1] };
+    }
+    if (latest && series[id]) recent.push({ ...latest, series: series[id] });
+  }
+  recent.sort((a, b) => b.at - a.at);
+  for (const r of recent.slice(0, 3)) {
+    const media = r.series.media === "anime" ? "anime" : r.series.media === "novel" ? "novel" : "comic";
+    recordActivity(userId, media === "anime" ? "watched" : "read", {
+      media,
+      title: r.series.title,
+      unit: r.title || (r.number ? (media === "anime" ? `Episode ${r.number}` : `Chapter ${r.number}`) : undefined),
+      cover: r.series.cover,
+      sourceUrl: r.series.sourceUrl,
+    });
+  }
+}
+
+const LIST_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+const listCode = () => Array.from({ length: 10 }, () => LIST_ALPHABET[randomInt(LIST_ALPHABET.length)]).join("");
+
+function cleanItem(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const title = typeof raw.title === "string" ? raw.title.trim().slice(0, 200) : "";
+  if (!title) return null;
+  return {
+    title,
+    media: raw.media === "novel" || raw.media === "anime" ? raw.media : "comic",
+    source: typeof raw.source === "string" ? raw.source.slice(0, 100) : undefined,
+    sourceUrl: httpsUrl(raw.sourceUrl),
+    cover: httpsUrl(raw.cover),
+    anilistId: Number.isInteger(raw.anilistId) && raw.anilistId > 0 ? raw.anilistId : undefined,
+  };
+}
+
+function sharedList(code) {
+  if (!/^[a-z0-9]{6,20}$/.test(code)) return null;
+  const row = db.prepare("SELECT shared_lists.*, users.username FROM shared_lists JOIN users ON users.id = shared_lists.owner WHERE code = ?").get(code);
+  if (!row) return null;
+  return {
+    code: row.code,
+    title: row.title,
+    owner: { id: String(row.owner), username: row.username, displayName: null, avatarUrl: null },
+    items: JSON.parse(row.items),
+    at: new Date(row.created_at).toISOString(),
+  };
+}
+
+const escapeHtml = (text) => String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+const listPage = (list) => `<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(list.title)} · SCANCORE</title>
+<body style="font:16px/1.5 system-ui,sans-serif;max-width:48em;margin:3em auto;padding:0 1em;background:#0e0f12;color:#e8e8ec">
+<p style="color:#8a8a94;margin:0">Shared by @${escapeHtml(list.owner.username)}</p>
+<h1 style="font-size:1.4em;margin:.2em 0 .6em">${escapeHtml(list.title)}</h1>
+<p>${list.items.length} series. In SCANCORE, open Activity → Friends → <b>Open a shared list</b> and enter <code>${escapeHtml(list.code)}</code> to add them all to your library.</p>
+<ul style="padding-left:1.2em">${list.items
+  .map((i) => `<li>${i.sourceUrl ? `<a style="color:#e8e8ec" href="${escapeHtml(i.sourceUrl)}" rel="noreferrer">${escapeHtml(i.title)}</a>` : escapeHtml(i.title)} <span style="color:#8a8a94">· ${escapeHtml(i.media)}</span></li>`)
+  .join("")}</ul>`;
+
+const REACTIONS = new Set(["LIKE", "LOVE", "LAUGH", "WOW", "SAD", "ANGRY"]);
+function threadOf(raw) {
+  const thread = String(raw ?? "").trim();
+  if (!/^(u:[0-9a-f-]{36}|c:[\s\S]{1,500})$/.test(thread)) throw new HttpError(400, "Invalid chapter.");
+  return thread.toLowerCase();
+}
+
+// ------------------------------------------------------------------ parties
+
+// Watch parties: a host opens a room and shares its code; everyone in it
+// streams the episode from their own source, and the host's player state
+// (episode, playing or paused, position) goes to the others. Chat lines
+// pass through. Nothing is stored; a room ends when its host leaves (after
+// a grace period for reconnecting) or after six hours.
+const PARTY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const PARTY_CODE = /^[A-HJ-NP-Z2-9]{6}$/;
+const PARTY_LIFETIME_MS = 6 * 60 * 60_000;
+const PARTY_HOST_GRACE_MS = 30_000;
+const PARTY_STREAM_MS = 30 * 60_000;
+const parties = new Map();
+const partyBus = new EventEmitter();
+partyBus.setMaxListeners(0);
+
+const partyMember = (user) => ({ userId: String(user.id), name: user.username, avatar: null });
+const partyMembers = (room) => ({ type: "members", host: room.host, members: [...room.members.values()].map(({ streams, ...m }) => m) });
+function partyPublish(code, message) {
+  partyBus.emit(code, message);
+}
+setInterval(() => {
+  for (const [code, room] of parties)
+    if (now() - room.created > PARTY_LIFETIME_MS) {
+      parties.delete(code);
+      partyPublish(code, { type: "ended" });
+    }
+}, 60_000).unref();
+
+function partyState(value) {
+  if (typeof value !== "object" || value === null) return null;
+  const anime = value.anime;
+  if (!anime || !Number.isInteger(anime.anilistId) || typeof anime.title !== "string") return null;
+  if (typeof value.episode !== "number" || typeof value.playing !== "boolean" || typeof value.position !== "number") return null;
+  if (!Number.isFinite(value.episode) || !Number.isFinite(value.position) || value.position < 0) return null;
+  const cover = typeof anime.cover === "string" && anime.cover.startsWith("https://") ? anime.cover.slice(0, 500) : null;
+  return { anime: { anilistId: anime.anilistId, title: anime.title.slice(0, 200), cover }, episode: value.episode, playing: value.playing, position: value.position, at: now() };
+}
+
+function partyStream(request, response, user, room) {
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-store, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  const write = (event, data) => response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const member = partyMember(user);
+  response.write("retry: 5000\n\n");
+  write("hello", { you: member.userId, host: room.host });
+  if (member.userId === room.host && room.hostGone) {
+    clearTimeout(room.hostGone);
+    room.hostGone = undefined;
+  }
+  const known = room.members.get(member.userId);
+  room.members.set(member.userId, { ...member, streams: (known?.streams ?? 0) + 1 });
+  let finished = false;
+  const listener = (message) => {
+    if (message.type === "state") write("state", { state: { ...message.state, age: Math.max(0, now() - message.state.at) } });
+    else {
+      const { type, ...data } = message;
+      write(type, data);
+    }
+    if (message.type === "ended") response.end();
+  };
+  partyBus.on(room.code, listener);
+  if (room.state) listener({ type: "state", state: room.state });
+  partyPublish(room.code, partyMembers(room));
+  const ping = setInterval(() => response.write(": ping\n\n"), LIVE_PING_MS);
+  const end = setTimeout(() => response.end(), PARTY_STREAM_MS);
+  response.on("close", () => {
+    if (finished) return;
+    finished = true;
+    clearInterval(ping);
+    clearTimeout(end);
+    partyBus.off(room.code, listener);
+    if (parties.get(room.code) !== room) return;
+    const current = room.members.get(member.userId);
+    if (current && current.streams > 1) current.streams -= 1;
+    else room.members.delete(member.userId);
+    if (member.userId === room.host && !room.members.has(member.userId))
+      room.hostGone = setTimeout(() => {
+        if (parties.get(room.code) !== room || room.members.has(room.host)) return;
+        parties.delete(room.code);
+        partyPublish(room.code, { type: "ended" });
+      }, PARTY_HOST_GRACE_MS);
+    partyPublish(room.code, partyMembers(room));
+  });
+}
+
 // ------------------------------------------------------------------ routes
 
 async function route(request, response) {
@@ -316,6 +568,10 @@ async function route(request, response) {
       version: VERSION,
       signup: ALLOW_SIGNUP,
       appSync: { devices: true, devicesOnly: true, live: true },
+      party: true,
+      friends: true,
+      lists: true,
+      reactions: true,
     });
 
   if (method === "POST" && path === "/api/auth/signup") {
@@ -402,6 +658,7 @@ async function route(request, response) {
         "ON CONFLICT(user_id, device_id) DO UPDATE SET name = excluded.name, platform = excluded.platform, " +
         "data = excluded.data, updated_at = excluded.updated_at",
     ).run(user.id, device[1], name, platform, JSON.stringify(body.data), updatedAt);
+    activityFromSnapshot(user.id, body.data);
     return send(response, 200, { updatedAt });
   }
 
@@ -431,6 +688,179 @@ async function route(request, response) {
     const delivered = liveBus.listenerCount(`user:${user.id}`);
     liveBus.emit(`user:${user.id}`, { type: body.type, from, to, data: body.data });
     return send(response, 202, { ok: true, listeners: delivered });
+  }
+
+  // Friends: {shareActivity, friends, sent, received}; POST {username}
+  // follows; PATCH {shareActivity}; DELETE ?user=<id> stops following.
+  if (path === "/api/app/friends") {
+    const user = requireUser(request);
+    if (method === "GET") {
+      const share = db.prepare("SELECT share_activity FROM users WHERE id = ?").get(user.id).share_activity === 1;
+      return send(response, 200, { shareActivity: share, ...friendsOf(user.id) });
+    }
+    if (method === "POST") {
+      const body = await readJson(request, 4096);
+      const name = String(body.username ?? "").trim().replace(/^@/, "");
+      if (!name) throw new HttpError(400, "Type a username.");
+      const other = db.prepare("SELECT id, username FROM users WHERE username = ?").get(name);
+      if (!other) throw new HttpError(404, "No one has that username.");
+      if (other.id === user.id) throw new HttpError(400, "That is you.");
+      db.prepare("INSERT OR IGNORE INTO follows(follower, following, created_at) VALUES(?, ?, ?)").run(user.id, other.id, now());
+      return send(response, 201, person(other));
+    }
+    if (method === "PATCH") {
+      const body = await readJson(request, 1024);
+      if (typeof body.shareActivity !== "boolean") throw new HttpError(400, "shareActivity must be true or false.");
+      db.prepare("UPDATE users SET share_activity = ? WHERE id = ?").run(body.shareActivity ? 1 : 0, user.id);
+      return send(response, 200, { shareActivity: body.shareActivity });
+    }
+    if (method === "DELETE") {
+      db.prepare("DELETE FROM follows WHERE follower = ? AND following = ?").run(user.id, Number(url.searchParams.get("user")) || 0);
+      return send(response, 200, { ok: true });
+    }
+  }
+
+  // What friends who share it read and watched, newest first.
+  if (method === "GET" && path === "/api/app/activity") {
+    const user = requireUser(request);
+    const before = url.searchParams.get("before") ? Date.parse(url.searchParams.get("before")) : now() + 1;
+    if (!Number.isFinite(before)) throw new HttpError(400, "Invalid date.");
+    const friends = friendsOf(user.id).friends.map((f) => Number(f.id));
+    if (friends.length === 0) return send(response, 200, { events: [] });
+    const rows = db
+      .prepare(
+        `SELECT activity.*, users.username FROM activity JOIN users ON users.id = activity.user_id
+         WHERE users.share_activity = 1 AND activity.user_id IN (${friends.map(() => "?").join(",")}) AND activity.created_at < ?
+         ORDER BY activity.created_at DESC LIMIT 50`,
+      )
+      .all(...friends, before);
+    return send(response, 200, {
+      events: rows.map((r) => ({
+        id: String(r.id),
+        user: person({ id: r.user_id, username: r.username }),
+        type: r.type,
+        payload: JSON.parse(r.payload),
+        at: new Date(r.created_at).toISOString(),
+      })),
+    });
+  }
+
+  // Lists shared by code: GET (mine), POST {title, items}, DELETE ?code=.
+  if (path === "/api/app/lists") {
+    const user = requireUser(request);
+    if (method === "GET") {
+      const rows = db.prepare("SELECT code, title, items, created_at FROM shared_lists WHERE owner = ? ORDER BY created_at DESC LIMIT 200").all(user.id);
+      return send(response, 200, {
+        lists: rows.map((r) => ({ code: r.code, title: r.title, count: JSON.parse(r.items).length, at: new Date(r.created_at).toISOString() })),
+      });
+    }
+    if (method === "POST") {
+      const body = await readJson(request, 512 * 1024);
+      const items = (Array.isArray(body.items) ? body.items : []).map(cleanItem).filter(Boolean).slice(0, 500);
+      if (items.length === 0) throw new HttpError(400, "The list is empty.");
+      if (db.prepare("SELECT COUNT(*) AS n FROM shared_lists WHERE owner = ?").get(user.id).n >= 200)
+        throw new HttpError(400, "You have shared as many lists as this server keeps. Remove one first.");
+      const title = String(body.title ?? "").trim().slice(0, 100) || "A list";
+      let code = listCode();
+      while (db.prepare("SELECT 1 FROM shared_lists WHERE code = ?").get(code)) code = listCode();
+      db.prepare("INSERT INTO shared_lists(code, owner, title, items, created_at) VALUES(?, ?, ?, ?, ?)").run(code, user.id, title, JSON.stringify(items), now());
+      recordActivity(user.id, "shared", { media: items[0].media, title, unit: String(items.length) });
+      return send(response, 201, { code });
+    }
+    if (method === "DELETE") {
+      db.prepare("DELETE FROM shared_lists WHERE owner = ? AND code = ?").run(user.id, url.searchParams.get("code") ?? "");
+      return send(response, 200, { ok: true });
+    }
+  }
+  const listApi = path.match(/^\/api\/app\/lists\/([A-Za-z0-9]{6,20})$/);
+  if (method === "GET" && listApi) {
+    const list = sharedList(listApi[1].toLowerCase());
+    if (!list) throw new HttpError(404, "This list is not shared any more.");
+    return send(response, 200, list);
+  }
+  const listWeb = path.match(/^\/lists\/([A-Za-z0-9]{6,20})$/);
+  if (method === "GET" && listWeb) {
+    const list = sharedList(listWeb[1].toLowerCase());
+    if (!list) throw new HttpError(404, "This list is not shared any more.");
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    return response.end(listPage(list));
+  }
+
+  // Reactions on a chapter's pages: GET ?thread= {pages, mine}; POST
+  // {thread, page, type} (type null takes it back).
+  if (path === "/api/app/reactions") {
+    if (method === "GET") {
+      const thread = threadOf(url.searchParams.get("thread"));
+      const user = currentUser(request);
+      const pages = new Map();
+      for (const r of db.prepare("SELECT page, type, COUNT(*) AS n FROM page_reactions WHERE thread = ? GROUP BY page, type").all(thread)) {
+        const entry = pages.get(r.page) ?? { page: r.page, total: 0, counts: {} };
+        entry.counts[r.type] = r.n;
+        entry.total += r.n;
+        pages.set(r.page, entry);
+      }
+      const mine = {};
+      if (user) for (const r of db.prepare("SELECT page, type FROM page_reactions WHERE thread = ? AND user_id = ?").all(thread, user.id)) mine[String(r.page)] = r.type;
+      return send(response, 200, { pages: [...pages.values()].sort((a, b) => a.page - b.page), mine });
+    }
+    if (method === "POST") {
+      const user = requireUser(request);
+      const body = await readJson(request, 4096);
+      const thread = threadOf(body.thread);
+      const page = Number(body.page);
+      if (!Number.isInteger(page) || page < 0 || page > 5000) throw new HttpError(400, "Invalid page.");
+      if (body.type === null) {
+        db.prepare("DELETE FROM page_reactions WHERE user_id = ? AND thread = ? AND page = ?").run(user.id, thread, page);
+        return send(response, 200, { page, type: null });
+      }
+      if (!REACTIONS.has(body.type)) throw new HttpError(400, "Invalid reaction.");
+      db.prepare(
+        "INSERT INTO page_reactions(user_id, thread, page, type, created_at) VALUES(?, ?, ?, ?, ?) " +
+          "ON CONFLICT(user_id, thread, page) DO UPDATE SET type = excluded.type, created_at = excluded.created_at",
+      ).run(user.id, thread, page, body.type, now());
+      return send(response, 200, { page, type: body.type });
+    }
+  }
+
+  // Watch parties: POST opens one ({code}); GET /<code> is its stream;
+  // POST /<code> {type: "state", state} (host), {type: "chat", text},
+  // {type: "end"} (host).
+  if (method === "POST" && path === "/api/app/party") {
+    const user = requireUser(request);
+    let code = "";
+    do code = Array.from({ length: 6 }, () => PARTY_ALPHABET[randomInt(PARTY_ALPHABET.length)]).join("");
+    while (parties.has(code));
+    const room = { code, host: String(user.id), created: now(), state: null, members: new Map() };
+    parties.set(code, room);
+    return send(response, 201, { code });
+  }
+  const partyPath = path.match(/^\/api\/app\/party\/([A-Za-z0-9]{6})$/);
+  if (partyPath) {
+    const user = requireUser(request);
+    const code = partyPath[1].toUpperCase();
+    const room = PARTY_CODE.test(code) ? parties.get(code) : undefined;
+    if (!room) throw new HttpError(404, "No party with that code.");
+    if (method === "GET") return partyStream(request, response, user, room);
+    if (method === "POST") {
+      const body = await readJson(request, 4096);
+      if (body.type === "state") {
+        const state = partyState(body.state);
+        if (!state) throw new HttpError(400, "Invalid player state.");
+        if (room.host !== String(user.id)) throw new HttpError(403, "Only the host steers the party.");
+        room.state = state;
+        partyPublish(code, { type: "state", state });
+      } else if (body.type === "chat") {
+        const text = typeof body.text === "string" ? body.text.trim().slice(0, 300) : "";
+        if (!text) throw new HttpError(400, "Say something first.");
+        partyPublish(code, { type: "chat", from: partyMember(user), text, at: now() });
+      } else if (body.type === "end") {
+        if (room.host !== String(user.id)) throw new HttpError(404, "No party with that code.");
+        clearTimeout(room.hostGone);
+        parties.delete(code);
+        partyPublish(code, { type: "ended" });
+      } else throw new HttpError(400, "Unknown party message.");
+      return send(response, 202, { ok: true });
+    }
   }
 
   throw new HttpError(404, "Not found.");

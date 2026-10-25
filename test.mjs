@@ -14,7 +14,7 @@ let server;
 
 before(async () => {
   server = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "server.mjs"], {
-    env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", DATA_DIR: dir },
+    env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", DATA_DIR: dir, ATTEMPT_LIMIT: "1000" },
     stdio: "ignore",
   });
   for (let i = 0; i < 50; i++) {
@@ -169,4 +169,119 @@ test("live: presence, progress to the others, handoff to one device, isolation",
   assert.equal(stranger.events.length, 0);
   laptop.close();
   stranger.close();
+});
+
+const call = (cookie, path, method = "GET", body) =>
+  fetch(`${base}${path}`, {
+    method,
+    headers: { Cookie: cookie, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+test("friends: follow both ways, sharing what you read, activity from snapshots", async () => {
+  const ann = await signUp("ann_f");
+  const ben = await signUp("ben_f");
+  assert.equal((await call(ann, "/api/app/friends", "POST", { username: "@BEN_F" })).status, 201);
+  assert.equal((await call(ann, "/api/app/friends", "POST", { username: "nobody_here" })).status, 404);
+  let mine = await (await call(ben, "/api/app/friends")).json();
+  assert.deepEqual(mine.received.map((p) => p.username), ["ann_f"]);
+  await call(ben, "/api/app/friends", "POST", { username: "ann_f" });
+  mine = await (await call(ben, "/api/app/friends")).json();
+  assert.deepEqual(mine.friends.map((p) => p.username), ["ann_f"]);
+  assert.equal(mine.shareActivity, false);
+
+  // Ann reads a chapter: nothing shows until she shares.
+  const snapshot = (at) => ({
+    name: "Laptop",
+    platform: "linux",
+    data: {
+      series: { "comic:x:https://example.test/s": { media: "comic", title: "Solo Leveling", cover: "https://example.test/c.jpg", sourceUrl: "https://example.test/s" } },
+      progress: { "comic:x:https://example.test/s": { c12: ["Chapter 12", "12", "https://example.test/s/12", "", 0.4, 0, at] } },
+    },
+  });
+  await put(ann, "device-ann-1", snapshot(Math.floor(Date.now() / 1000)));
+  assert.deepEqual((await (await call(ben, "/api/app/activity")).json()).events, []);
+  await call(ann, "/api/app/friends", "PATCH", { shareActivity: true });
+  await put(ann, "device-ann-1", snapshot(Math.floor(Date.now() / 1000)));
+  await put(ann, "device-ann-1", snapshot(Math.floor(Date.now() / 1000)));
+  const feed = (await (await call(ben, "/api/app/activity")).json()).events;
+  assert.equal(feed.length, 1);
+  assert.equal(feed[0].user.username, "ann_f");
+  assert.equal(feed[0].type, "read");
+  assert.equal(feed[0].payload.title, "Solo Leveling");
+  assert.equal(feed[0].payload.unit, "Chapter 12");
+  // Old reading is not news.
+  await put(ann, "device-ann-2", { ...snapshot(1000), data: { ...snapshot(1000).data, series: { "comic:x:https://example.test/t": { media: "comic", title: "Old" } }, progress: { "comic:x:https://example.test/t": { c1: ["Ch 1", "1", "", "", 1, 1, 1000] } } } });
+  assert.equal((await (await call(ben, "/api/app/activity")).json()).events.length, 1);
+  // Ben does not share: Ann sees nothing of his.
+  assert.deepEqual((await (await call(ann, "/api/app/activity")).json()).events, []);
+  // Unfollowing ends the friendship.
+  const id = mine.friends[0].id;
+  await call(ben, `/api/app/friends?user=${id}`, "DELETE");
+  assert.deepEqual((await (await call(ben, "/api/app/friends")).json()).friends, []);
+});
+
+test("lists: shared by code, opened by anyone, unsafe links dropped", async () => {
+  const owner = await signUp("lister_l");
+  const made = await call(owner, "/api/app/lists", "POST", {
+    title: "Picks",
+    items: [{ title: "One", media: "comic", sourceUrl: "https://example.test/1" }, { title: "Two", media: "novel", sourceUrl: "javascript:alert(1)" }, { media: "comic" }],
+  });
+  assert.equal(made.status, 201);
+  const { code } = await made.json();
+  const list = await (await fetch(`${base}/api/app/lists/${code}`)).json();
+  assert.equal(list.title, "Picks");
+  assert.equal(list.items.length, 2);
+  assert.equal(list.items[1].sourceUrl, undefined);
+  const html = await (await fetch(`${base}/lists/${code}`)).text();
+  assert.match(html, /Picks/);
+  assert.doesNotMatch(html, /javascript:/);
+  assert.equal((await (await call(owner, "/api/app/lists")).json()).lists.length, 1);
+  await call(owner, `/api/app/lists?code=${code}`, "DELETE");
+  assert.equal((await fetch(`${base}/api/app/lists/${code}`)).status, 404);
+  assert.equal((await call(owner, "/api/app/lists", "POST", { title: "Empty", items: [] })).status, 400);
+});
+
+test("reactions: per page, one each, taken back", async () => {
+  const a = await signUp("react_a");
+  const b = await signUp("react_b");
+  const thread = "c:Solo Leveling|12";
+  await call(a, "/api/app/reactions", "POST", { thread, page: 3, type: "LOVE" });
+  await call(b, "/api/app/reactions", "POST", { thread, page: 3, type: "LAUGH" });
+  await call(b, "/api/app/reactions", "POST", { thread, page: 3, type: "WOW" });
+  let got = await (await call(b, `/api/app/reactions?thread=${encodeURIComponent(thread)}`)).json();
+  assert.deepEqual(got.pages, [{ page: 3, total: 2, counts: { LOVE: 1, WOW: 1 } }]);
+  assert.deepEqual(got.mine, { 3: "WOW" });
+  await call(b, "/api/app/reactions", "POST", { thread, page: 3, type: null });
+  got = await (await fetch(`${base}/api/app/reactions?thread=${encodeURIComponent(thread)}`)).json();
+  assert.deepEqual(got.pages, [{ page: 3, total: 1, counts: { LOVE: 1 } }]);
+  assert.equal((await call(a, "/api/app/reactions", "POST", { thread: "x", page: 1, type: "LIKE" })).status, 400);
+  assert.equal((await call(a, "/api/app/reactions", "POST", { thread, page: 1, type: "MEH" })).status, 400);
+});
+
+test("watch party: the host's state reaches the guest, chat, end", async () => {
+  const host = await signUp("party_host");
+  const guest = await signUp("party_guest");
+  const opened = await call(host, "/api/app/party", "POST", {});
+  assert.equal(opened.status, 201);
+  const { code } = await opened.json();
+  assert.match(code, /^[A-HJ-NP-Z2-9]{6}$/);
+  const hostStream = await call(host, `/api/app/party/${code}`);
+  const guestStream = await call(guest, `/api/app/party/${code}`);
+  const reader = guestStream.body.getReader();
+  let seen = "";
+  const until = async (pattern) => {
+    while (!pattern.test(seen)) seen += new TextDecoder().decode((await reader.read()).value);
+  };
+  await until(/event: hello/);
+  const state = { anime: { anilistId: 21, title: "One Piece" }, episode: 5, playing: true, position: 61 };
+  assert.equal((await call(guest, `/api/app/party/${code}`, "POST", { type: "state", state })).status, 403);
+  assert.equal((await call(host, `/api/app/party/${code}`, "POST", { type: "state", state })).status, 202);
+  await until(/event: state\ndata: .*"episode":5/);
+  await call(guest, `/api/app/party/${code}`, "POST", { type: "chat", text: "hi" });
+  await until(/event: chat\ndata: .*"text":"hi"/);
+  await call(host, `/api/app/party/${code}`, "POST", { type: "end" });
+  await until(/event: ended/);
+  hostStream.body.cancel();
+  assert.equal((await call(guest, `/api/app/party/${code}`, "POST", { type: "chat", text: "late" })).status, 404);
 });

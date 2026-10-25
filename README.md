@@ -3,7 +3,10 @@
 A small sync server for [SCANCORE](https://github.com/medium-gh/scancore):
 accounts and device sync on your own computer, NAS or server, instead of
 scancore.onl. Every SCANCORE app signed in to the same account keeps the same
-library, reading and watching progress, removals and activity.
+library, reading and watching progress, removals and activity. The people
+on your server can also be friends (and see what each other read, if they
+choose to share it), share lists by link, react to comic pages and watch
+anime together in watch parties.
 
 It is one file (`server.mjs`) with no dependencies: Node's own HTTP server,
 SQLite and scrypt. Each app keeps one snapshot of itself here and merges the
@@ -61,6 +64,7 @@ Environment variables:
 | `TRUST_PROXY` | `false` | `true` behind Caddy, nginx or another proxy (uses its forwarded address and HTTPS headers). |
 | `MAX_DEVICES` | `20` | Devices per account. |
 | `MAX_SNAPSHOT_MB` | `16` | Largest snapshot a device may store. |
+| `ATTEMPT_LIMIT` | `10` | Sign-in and sign-up attempts per address in 15 minutes. |
 
 ## Looking after it
 
@@ -88,7 +92,8 @@ Environment variables:
 
 What the app uses, for anyone writing their own client:
 
-- `GET /api/capabilities` → `{appSync: {devices: true, devicesOnly: true, live: true}}`
+- `GET /api/capabilities` → `{appSync: {devices: true, devicesOnly: true, live: true},
+  party: true, friends: true, lists: true, reactions: true}`
 - `POST /api/auth/signup` `{email, username, password}`,
   `POST /api/auth/login` `{email (or username), password}`,
   `POST /api/auth/logout`, `GET /api/auth/session` → `{user | null}`
@@ -104,6 +109,29 @@ What the app uses, for anyone writing their own client:
 - `POST /api/app/live` `{from: {id, name, platform}, type: "progress" |
   "handoff", to?, data}` passes `data` on to the account's other open apps
   (or only to `to`). Nothing is stored.
+- Watch parties: `POST /api/app/party` → `{code}` (six letters and digits);
+  `GET /api/app/party/<code>` is the party's stream of server-sent events
+  (`hello` `{you, host}`, then `state` `{state: {anime, episode, playing,
+  position, age}}`, `members`, `chat` and `ended`); `POST
+  /api/app/party/<code>` `{type: "state", state}` (the host),
+  `{type: "chat", text}` or `{type: "end"}` (the host). Nothing is stored;
+  a party ends when its host leaves or after six hours.
+- Friends: `GET /api/app/friends` → `{shareActivity, friends, sent,
+  received}` (people as `{id, username}`); `POST` `{username}` follows
+  someone (following each other makes friends); `PATCH`
+  `{shareActivity}`; `DELETE ?user=<id>` stops following.
+- `GET /api/app/activity?before=<ISO date>` → `{events: [{user, type
+  ("read", "watched", "shared"), payload {media, title, unit, cover,
+  sourceUrl}, at}]}`: what friends who share it read lately, taken from
+  their devices' snapshots (one line per series an hour).
+- Shared lists: `POST /api/app/lists` `{title, items: [{title, media,
+  source, sourceUrl, cover, anilistId}]}` → `{code}`; `GET
+  /api/app/lists/<code>` (anyone) and the page `/lists/<code>`; `GET
+  /api/app/lists` (mine), `DELETE /api/app/lists?code=<code>`.
+- Reactions on a comic's pages: `GET /api/app/reactions?thread=<thread>`
+  → `{pages: [{page, total, counts}], mine}`; `POST {thread, page,
+  type}` (`LIKE`, `LOVE`, `LAUGH`, `WOW`, `SAD`, `ANGRY`, or `null` to
+  take it back). A thread is `c:<series title>|<chapter number>`.
 
 ## Licence
 
