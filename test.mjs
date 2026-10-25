@@ -285,3 +285,29 @@ test("watch party: the host's state reaches the guest, chat, end", async () => {
   hostStream.body.cancel();
   assert.equal((await call(guest, `/api/app/party/${code}`, "POST", { type: "chat", text: "late" })).status, 404);
 });
+
+test("where the anime leaves off: seeded points, suggestions and votes", async () => {
+  // Seeded: Attack on Titan season 1 goes on from chapter 34.
+  const seeded = await (await fetch(`${base}/api/story?anime=16498,21459`)).json();
+  assert.equal(seeded.points["16498"][0].chapter, 34);
+  assert.equal(seeded.points["16498"][0].seeded, true);
+  assert.equal(seeded.points["21459"][0].chapter, 22);
+  const a = await signUp("story_a");
+  const b = await signUp("story_b");
+  assert.equal((await fetch(`${base}/api/story`, json({ animeId: 1, media: "comic", chapter: 5 }))).status, 401);
+  assert.equal((await call(a, "/api/story", "POST", { animeId: 1, media: "comic" })).status, 400);
+  assert.equal((await call(a, "/api/story", "POST", { animeId: 1, media: "comic", chapter: 5, volume: 2 })).status, 400);
+  const added = await (await call(a, "/api/story", "POST", { animeId: 1, media: "comic", sourceId: 9, chapter: 5 })).json();
+  assert.equal(added.existed, false);
+  // The same point from someone else is a vote for it.
+  assert.equal((await (await call(b, "/api/story", "POST", { animeId: 1, media: "comic", chapter: 5 })).json()).existed, true);
+  let mine = (await (await call(a, "/api/story?anime=1")).json()).points["1"][0];
+  assert.deepEqual([mine.score, mine.mine, mine.submitted, mine.sourceId], [2, 1, true, 9]);
+  assert.equal((await call(b, "/api/story/vote", "POST", { id: added.id, value: -1 })).status, 200);
+  assert.equal((await (await call(b, "/api/story?anime=1")).json()).points["1"][0].score, 0);
+  assert.equal((await call(b, "/api/story/vote", "POST", { id: added.id, value: 0 })).status, 200);
+  mine = (await (await call(b, "/api/story?anime=1")).json()).points["1"][0];
+  assert.deepEqual([mine.score, mine.mine, mine.submitted], [1, 0, false]);
+  assert.equal((await call(b, "/api/story/vote", "POST", { id: "nope", value: 1 })).status, 404);
+  assert.equal((await call(b, "/api/story/vote", "POST", { id: added.id, value: 3 })).status, 400);
+});

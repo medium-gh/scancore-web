@@ -4,7 +4,8 @@
 // removals, reading and watching progress, and activity) and reads the
 // others'; the app merges them itself, so the server only stores them.
 // Also: live progress between an account's apps, watch parties, friends
-// (and what they read), lists shared by link, and reactions on pages.
+// (and what they read), lists shared by link, reactions on pages, and where
+// each anime leaves off in its comic or novel.
 //
 // No dependencies: Node's own HTTP server, SQLite and scrypt.
 //
@@ -14,9 +15,10 @@
 
 import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
-import { randomBytes, randomInt, scrypt, timingSafeEqual, createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { createHash, randomBytes, randomInt, randomUUID, scrypt, timingSafeEqual } from "node:crypto";
+import { mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 
@@ -101,10 +103,43 @@ db.exec(`
     PRIMARY KEY (user_id, thread, page)
   );
   CREATE INDEX IF NOT EXISTS page_reactions_thread ON page_reactions(thread);
+  -- Where an anime season leaves off in its comic or novel: the chapter or
+  -- volume to go on from, voted on by readers (story-seeds.json starts it).
+  CREATE TABLE IF NOT EXISTS story_points (
+    id TEXT PRIMARY KEY,
+    anime_id INTEGER NOT NULL,
+    media TEXT NOT NULL,
+    source_id INTEGER,
+    chapter REAL,
+    volume INTEGER,
+    seeded INTEGER NOT NULL DEFAULT 0,
+    score INTEGER NOT NULL DEFAULT 0,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS story_points_anime ON story_points(anime_id);
+  CREATE TABLE IF NOT EXISTS story_votes (
+    point_id TEXT NOT NULL REFERENCES story_points(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (point_id, user_id)
+  );
 `);
 // Whether a reader shares what they read with friends (off until they say).
 if (!db.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'share_activity'").get())
   db.exec("ALTER TABLE users ADD COLUMN share_activity INTEGER NOT NULL DEFAULT 0");
+
+// The same checked points as scancore.onl's, for anime nobody here has
+// given one yet ([animeId, media, sourceId, chapter, volume]).
+{
+  const seeds = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "story-seeds.json"), "utf8"));
+  const has = db.prepare("SELECT 1 FROM story_points WHERE anime_id = ? AND media = ?");
+  const add = db.prepare(
+    "INSERT INTO story_points(id, anime_id, media, source_id, chapter, volume, seeded, score, created_at) VALUES(?, ?, ?, ?, ?, ?, 1, 1, ?)",
+  );
+  for (const [animeId, media, sourceId, chapter, volume] of seeds.points)
+    if (!has.get(animeId, media)) add.run(randomUUID(), animeId, media, sourceId, chapter, volume, Date.now());
+}
 
 const now = () => Date.now();
 const sha256 = (text) => createHash("sha256").update(text).digest("hex");
@@ -541,6 +576,20 @@ function partyStream(request, response, user, room) {
   });
 }
 
+// Moves a reader's vote on a story point to `value` and keeps its score in
+// step; false when there is no such point.
+function storyVote(pointId, userId, value) {
+  if (!db.prepare("SELECT 1 FROM story_points WHERE id = ?").get(pointId)) return false;
+  const before = db.prepare("SELECT value FROM story_votes WHERE point_id = ? AND user_id = ?").get(pointId, userId)?.value ?? 0;
+  if (value === 0) db.prepare("DELETE FROM story_votes WHERE point_id = ? AND user_id = ?").run(pointId, userId);
+  else
+    db.prepare(
+      "INSERT INTO story_votes(point_id, user_id, value) VALUES(?, ?, ?) ON CONFLICT(point_id, user_id) DO UPDATE SET value = excluded.value",
+    ).run(pointId, userId, value);
+  if (value !== before) db.prepare("UPDATE story_points SET score = score + ? WHERE id = ?").run(value - before, pointId);
+  return true;
+}
+
 // ------------------------------------------------------------------ routes
 
 async function route(request, response) {
@@ -572,6 +621,7 @@ async function route(request, response) {
       friends: true,
       lists: true,
       reactions: true,
+      story: true,
     });
 
   if (method === "POST" && path === "/api/auth/signup") {
@@ -820,6 +870,70 @@ async function route(request, response) {
       ).run(user.id, thread, page, body.type, now());
       return send(response, 200, { page, type: body.type });
     }
+  }
+
+  // Where an anime leaves off: GET ?anime=1,2 {points: {"1": [...]}}, best
+  // first; POST {animeId, media, sourceId?, chapter | volume} adds a point
+  // (or votes for the same one); POST /vote {id, value} (1, -1 or 0).
+  if (path === "/api/story" && method === "GET") {
+    const ids = [...new Set((url.searchParams.get("anime") ?? "").split(",").map(Number))]
+      .filter((id) => Number.isInteger(id) && id > 0 && id < 10_000_000)
+      .slice(0, 50);
+    const user = currentUser(request);
+    const points = {};
+    const list = db.prepare(
+      "SELECT p.*, (SELECT value FROM story_votes v WHERE v.point_id = p.id AND v.user_id = ?) AS mine " +
+        "FROM story_points p WHERE anime_id = ? ORDER BY score DESC, created_at ASC LIMIT 20",
+    );
+    for (const id of ids)
+      points[String(id)] = list.all(user?.id ?? -1, id).map((p) => ({
+        id: p.id,
+        media: p.media,
+        sourceId: p.source_id,
+        chapter: p.chapter,
+        volume: p.volume,
+        score: p.score,
+        seeded: p.seeded === 1,
+        mine: p.mine ?? 0,
+        submitted: !!user && p.user_id === user.id,
+      }));
+    return send(response, 200, { points });
+  }
+  if (path === "/api/story" && method === "POST") {
+    const user = requireUser(request);
+    const body = await readJson(request, 4096);
+    const animeId = Number(body.animeId);
+    const media = String(body.media ?? "");
+    const sourceId = body.sourceId == null ? null : Number(body.sourceId);
+    const chapter = body.chapter == null ? null : Math.round(Number(body.chapter) * 10) / 10;
+    const volume = body.volume == null ? null : Number(body.volume);
+    if (!Number.isInteger(animeId) || animeId <= 0 || (media !== "comic" && media !== "novel"))
+      throw new HttpError(400, "An anime and comic or novel are required.");
+    if (sourceId !== null && (!Number.isInteger(sourceId) || sourceId <= 0)) throw new HttpError(400, "That source entry is not valid.");
+    const validChapter = chapter !== null && Number.isFinite(chapter) && chapter > 0 && chapter < 100_000;
+    const validVolume = volume !== null && Number.isInteger(volume) && volume > 0 && volume < 1000;
+    if (validChapter === validVolume) throw new HttpError(400, "Give a chapter or a volume.");
+    const existing = db
+      .prepare("SELECT id FROM story_points WHERE anime_id = ? AND media = ? AND chapter IS ? AND volume IS ?")
+      .get(animeId, media, validChapter ? chapter : null, validVolume ? volume : null);
+    if (existing) {
+      storyVote(existing.id, user.id, 1);
+      return send(response, 200, { ok: true, id: existing.id, existed: true });
+    }
+    const id = randomUUID();
+    db.prepare(
+      "INSERT INTO story_points(id, anime_id, media, source_id, chapter, volume, seeded, score, user_id, created_at) VALUES(?, ?, ?, ?, ?, ?, 0, 0, ?, ?)",
+    ).run(id, animeId, media, sourceId, validChapter ? chapter : null, validVolume ? volume : null, user.id, now());
+    storyVote(id, user.id, 1);
+    return send(response, 200, { ok: true, id, existed: false });
+  }
+  if (path === "/api/story/vote" && method === "POST") {
+    const user = requireUser(request);
+    const body = await readJson(request, 1024);
+    const value = Number(body.value);
+    if (![1, -1, 0].includes(value)) throw new HttpError(400, "A vote is 1, -1 or 0.");
+    if (!storyVote(String(body.id ?? ""), user.id, value)) throw new HttpError(404, "No such point.");
+    return send(response, 200, { ok: true });
   }
 
   // Watch parties: POST opens one ({code}); GET /<code> is its stream;

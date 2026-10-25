@@ -5,10 +5,11 @@ accounts and device sync on your own computer, NAS or server, instead of
 scancore.onl. Every SCANCORE app signed in to the same account keeps the same
 library, reading and watching progress, removals and activity. The people
 on your server can also be friends (and see what each other read, if they
-choose to share it), share lists by link, react to comic pages and watch
-anime together in watch parties.
+choose to share it), share lists by link, react to comic pages, watch
+anime together in watch parties, and say where each anime leaves off in its
+comic or novel (it starts with the same list of over 200 as scancore.onl).
 
-It is one file (`server.mjs`) with no dependencies: Node's own HTTP server,
+It is one file (`server.mjs`, plus that list in `story-seeds.json`) with no dependencies: Node's own HTTP server,
 SQLite and scrypt. Each app keeps one snapshot of itself here and merges the
 others' itself; the server only stores them.
 
@@ -93,7 +94,7 @@ Environment variables:
 What the app uses, for anyone writing their own client:
 
 - `GET /api/capabilities` → `{appSync: {devices: true, devicesOnly: true, live: true},
-  party: true, friends: true, lists: true, reactions: true}`
+  party: true, friends: true, lists: true, reactions: true, story: true}`
 - `POST /api/auth/signup` `{email, username, password}`,
   `POST /api/auth/login` `{email (or username), password}`,
   `POST /api/auth/logout`, `GET /api/auth/session` → `{user | null}`
@@ -132,6 +133,13 @@ What the app uses, for anyone writing their own client:
   → `{pages: [{page, total, counts}], mine}`; `POST {thread, page,
   type}` (`LIKE`, `LOVE`, `LAUGH`, `WOW`, `SAD`, `ANGRY`, or `null` to
   take it back). A thread is `c:<series title>|<chapter number>`.
+- Where an anime leaves off: `GET /api/story?anime=<AniList ids>` (anyone)
+  → `{points: {"<id>": [{id, media ("comic" or "novel"), sourceId,
+  chapter, volume, score, seeded, mine, submitted}]}}`, best first: the
+  chapter or volume to go on from after that season. `POST /api/story`
+  `{animeId, media, sourceId?, chapter | volume}` suggests one (the same
+  one again is a vote for it); `POST /api/story/vote` `{id, value}` (1, -1,
+  or 0 to take it back).
 
 ## Licence
 

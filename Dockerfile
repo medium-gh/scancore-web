@@ -1,6 +1,6 @@
 FROM node:24-alpine
 WORKDIR /app
-COPY package.json server.mjs ./
+COPY package.json server.mjs story-seeds.json ./
 ENV NODE_ENV=production DATA_DIR=/data PORT=8787
 RUN mkdir -p /data && chown node:node /data
 USER node
