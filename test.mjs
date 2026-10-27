@@ -14,7 +14,7 @@ let server;
 
 before(async () => {
   server = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "server.mjs"], {
-    env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", DATA_DIR: dir, ATTEMPT_LIMIT: "1000" },
+    env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", DATA_DIR: dir, ATTEMPT_LIMIT: "1000", PASSWORD_BREACH_CHECK: "false" },
     stdio: "ignore",
   });
   for (let i = 0; i < 50; i++) {
@@ -46,11 +46,15 @@ const put = (cookie, id, body) =>
 test("capabilities say devices only", async () => {
   const caps = await (await fetch(`${base}/api/capabilities`)).json();
   assert.deepEqual(caps.appSync, { devices: true, devicesOnly: true, live: true });
+  assert.equal(caps.recovery, false);
 });
 
 test("accounts: rules, sign-in, session, sign-out", async () => {
   const weak = await fetch(`${base}/api/auth/signup`, json({ email: "a@example.test", username: "aa_bb", password: "short" }));
   assert.equal(weak.status, 400);
+  const personal = await fetch(`${base}/api/auth/signup`, json({ email: "p@example.test", username: "lantern", password: "Lantern-77" }));
+  assert.equal(personal.status, 400);
+  assert.match((await personal.json()).error, /username or email/);
   const cookie = await signUp("reader_one");
   const session = await (await fetch(`${base}/api/auth/session`, { headers: { Cookie: cookie } })).json();
   assert.equal(session.user.username, "reader_one");

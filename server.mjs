@@ -158,6 +158,44 @@ async function checkPassword(password, stored) {
   return timingSafeEqual(actual, expected);
 }
 
+// Passwords from known data breaches are refused, as on scancore.onl.
+// Pwned Passwords is asked with the first five characters of the SHA-1 only
+// (k-anonymity, padded replies), so neither the password nor its hash
+// leaves this server. Down or slower than 5 s: the check is skipped, never locking
+// anyone out. PASSWORD_BREACH_CHECK=false turns it off (no internet).
+const BREACH_CHECK = process.env.PASSWORD_BREACH_CHECK !== "false";
+async function breachCount(password) {
+  if (!BREACH_CHECK) return null;
+  const digest = createHash("sha1").update(password, "utf8").digest("hex").toUpperCase();
+  try {
+    const response = await fetch(`https://api.pwnedpasswords.com/range/${digest.slice(0, 5)}`, {
+      headers: { "Add-Padding": "true", "User-Agent": `scancore-web/${VERSION}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) return null;
+    for (const line of (await response.text()).split("\n")) {
+      const [hash, count] = line.trim().split(":");
+      if (hash === digest.slice(5)) return Number(count) || 0;
+    }
+    return 0;
+  } catch {
+    return null;
+  }
+}
+
+// What is wrong with a password beyond the rules: built from the account's
+// own name or address, or seen in a breach. Empty when it is fine.
+async function unsafePassword(password, { username, email } = {}) {
+  const lowered = String(password).toLowerCase();
+  const own = [username, String(email ?? "").split("@")[0]]
+    .map((part) => String(part ?? "").trim().toLowerCase())
+    .filter((part) => part.length >= 4);
+  if (own.some((part) => lowered.includes(part))) return "Your password can't contain your username or email.";
+  if ((await breachCount(password)) > 0)
+    return "This password has appeared in a data breach, so it's easy to guess. Choose a different one.";
+  return "";
+}
+
 // ------------------------------------------------------------------ commands
 
 const [command, ...args] = process.argv.slice(2);
@@ -171,7 +209,8 @@ if (command === "passwd" || command === "delete") {
     db.prepare("DELETE FROM users WHERE id = ?").run(user.id);
     console.log("Deleted.");
   } else {
-    const problem = passwordProblem(args[1] ?? "");
+    const account = db.prepare("SELECT username, email FROM users WHERE id = ?").get(user.id);
+    const problem = passwordProblem(args[1] ?? "") || (await unsafePassword(args[1], account));
     if (problem) {
       console.error(problem);
       process.exit(1);
@@ -616,6 +655,9 @@ async function route(request, response) {
       server: "scancore-web",
       version: VERSION,
       signup: ALLOW_SIGNUP,
+      // No email here: a forgotten password is reset by whoever runs the
+      // server (node server.mjs passwd), and the app says so.
+      recovery: false,
       appSync: { devices: true, devicesOnly: true, live: true },
       party: true,
       friends: true,
@@ -633,7 +675,7 @@ async function route(request, response) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254)
       throw new HttpError(400, "Enter a valid email address");
     if (!/^[A-Za-z0-9_]{3,32}$/.test(username)) throw new HttpError(400, "3–32 letters, numbers or underscores");
-    const problem = passwordProblem(body.password);
+    const problem = passwordProblem(body.password) || (await unsafePassword(body.password, { username, email }));
     if (problem) throw new HttpError(400, problem);
     if (db.prepare("SELECT 1 FROM users WHERE email = ?").get(email))
       throw new HttpError(409, "An account with that email already exists.");

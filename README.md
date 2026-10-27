@@ -89,6 +89,7 @@ npm start
 | `MAX_DEVICES` | `20` | Devices per account. |
 | `MAX_SNAPSHOT_MB` | `16` | Largest snapshot a device may store. |
 | `ATTEMPT_LIMIT` | `10` | Sign-in and sign-up attempts per address in 15 minutes. |
+| `PASSWORD_BREACH_CHECK` | `true` | Refuse passwords from known data breaches (asks Pwned Passwords with 5 characters of a hash; the password never leaves the server). `false` without internet. |
 
 ## Looking after it
 
@@ -99,7 +100,7 @@ npm start
 
 ## Security
 
-* Passwords are stored as scrypt hashes. Sessions are random tokens in an HttpOnly cookie, stored hashed.
+* Passwords are stored as scrypt hashes. New ones that appeared in a known data breach, or that contain the account's username or email, are refused. Sessions are random tokens in an HttpOnly cookie, stored hashed.
 * Plain `http://` is fine on a home network you trust. Over the internet, use HTTPS: without it, passwords and your library travel unencrypted.
 * Sign-in and sign-up are limited to 10 attempts per 15 minutes per address.
 
